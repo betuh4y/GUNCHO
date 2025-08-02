@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>App de Guincho - Solicitação de Serviço</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     * {
       margin: 0;
@@ -118,6 +120,9 @@
       font-size: 0.9em;
       margin: 5px 0;
     }
+    #mapDiv {
+      height: 300px;
+    }
     @media (max-width: 600px) {
       body {
         padding: 5px;
@@ -192,6 +197,13 @@
       <button id="confirmActionBtn">Confirmar</button>
     </div>
   </div>
+  <div id="mapModal" class="modal">
+    <div class="modal-content">
+      <span class="close-button" onclick="closeMap()">×</span>
+      <h3>Mapa em Tempo Real</h3>
+      <div id="mapDiv"></div>
+    </div>
+  </div>
   <script type="module">
     import {
       initializeApp
@@ -229,6 +241,11 @@
     let userType = null;
     let currentUserUid = null;
     let editId = null;
+    let watchIds = new Map();
+    let currentMap = null;
+    let clientMarker = null;
+    let driverMarker = null;
+    let mapListener = null;
 
     // Autenticação
     document.getElementById("registerBtn").onclick = () => {
@@ -252,6 +269,7 @@
     };
     document.getElementById("logoutBtn").onclick = () => {
       signOut(auth);
+      stopAllWatches();
     };
     onAuthStateChanged(auth, user => {
       if (user) {
@@ -262,6 +280,7 @@
       } else {
         document.getElementById("authSection").style.display = "block";
         document.getElementById("appSection").style.display = "none";
+        stopAllWatches();
       }
     });
 
@@ -363,10 +382,44 @@
           <div class="request-item">
             <span>${new Date(req.timestamp).toLocaleString('pt-BR')} - ${req.description} - Status: ${req.status}</span>
             ${req.status === "pending" ? `<button onclick="cancelRequest('${id}')">Cancelar</button>` : ''}
+            ${req.status === "accepted" ? `<button onclick="showMap('${id}', ${req.location.lat}, ${req.location.lng})">Ver Mapa do Motorista</button>` : ''}
           </div>
         `).join('');
       });
     }
+
+    window.showMap = (requestId, clientLat, clientLng) => {
+      document.getElementById("mapModal").style.display = "block";
+      if (currentMap) {
+        currentMap.remove();
+      }
+      currentMap = L.map('mapDiv').setView([clientLat, clientLng], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+      }).addTo(currentMap);
+      clientMarker = L.marker([clientLat, clientLng]).addTo(currentMap).bindPopup('Sua Localização');
+      driverMarker = L.marker([clientLat, clientLng]).addTo(currentMap).bindPopup('Motorista'); // Posição inicial temporária
+      const driverLocRef = ref(db, `requests/${requestId}/driverLocation`);
+      mapListener = onValue(driverLocRef, snap => {
+        if (snap.exists()) {
+          const loc = snap.val();
+          driverMarker.setLatLng([loc.lat, loc.lng]);
+          currentMap.panTo([loc.lat, loc.lng]);
+        }
+      });
+    };
+
+    window.closeMap = () => {
+      document.getElementById("mapModal").style.display = "none";
+      if (currentMap) {
+        currentMap.remove();
+        currentMap = null;
+      }
+      if (mapListener) {
+        mapListener();
+        mapListener = null;
+      }
+    };
 
     window.cancelRequest = id => {
       if (confirm("Cancelar esta solicitação?")) {
@@ -406,13 +459,61 @@
             <button onclick="completeRequest('${id}')">Concluir</button>
           </div>
         `).join('');
+        // Iniciar compartilhamento de localização para solicitações aceitas que ainda não estão sendo rastreadas
+        accepted.forEach(([id, _]) => {
+          if (!watchIds.has(id)) {
+            startLocationSharing(id);
+          }
+        });
+        // Parar compartilhamento para solicitações que não estão mais aceitas
+        for (let [wId] of watchIds) {
+          if (!accepted.some(([aId]) => aId === wId)) {
+            stopLocationSharing(wId);
+          }
+        }
       });
+    }
+
+    function startLocationSharing(requestId) {
+      if (navigator.geolocation) {
+        const watchId = navigator.geolocation.watchPosition(pos => {
+          update(ref(db, `requests/${requestId}/driverLocation`), {
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude
+          });
+        }, err => {
+          console.error("Erro ao compartilhar localização:", err);
+        }, { enableHighAccuracy: true });
+        watchIds.set(requestId, watchId);
+      } else {
+        alert("Geolocalização não suportada.");
+      }
+    }
+
+    function stopLocationSharing(requestId) {
+      const watchId = watchIds.get(requestId);
+      if (watchId) {
+        navigator.geolocation.clearWatch(watchId);
+        watchIds.delete(requestId);
+        remove(ref(db, `requests/${requestId}/driverLocation`)); // Limpar localização ao parar
+      }
+    }
+
+    function stopAllWatches() {
+      for (let [id, watchId] of watchIds) {
+        navigator.geolocation.clearWatch(watchId);
+        remove(ref(db, `requests/${id}/driverLocation`));
+      }
+      watchIds.clear();
     }
 
     window.acceptRequest = id => {
       if (confirm("Aceitar esta solicitação?")) {
         update(ref(db, `requests/${id}`), { status: "accepted", driverId: currentUserUid })
-          .then(() => alert("Solicitação aceita!"))
+          .then(() => {
+            alert("Solicitação aceita!");
+            startLocationSharing(id);
+          })
           .catch(err => alert("Erro: " + err.message));
       }
     };
@@ -420,15 +521,23 @@
     window.completeRequest = id => {
       if (confirm("Concluir esta solicitação?")) {
         update(ref(db, `requests/${id}`), { status: "completed" })
-          .then(() => alert("Solicitação concluída!"))
+          .then(() => {
+            alert("Solicitação concluída!");
+            stopLocationSharing(id);
+          })
           .catch(err => alert("Erro: " + err.message));
       }
     };
 
     // Modal genérico
-    document.querySelector(".close-button").onclick = () => {
-      document.getElementById("confirmModal").style.display = "none";
-    };
+    document.querySelectorAll(".close-button").forEach(btn => {
+      btn.onclick = () => {
+        btn.closest(".modal").style.display = "none";
+        if (btn.closest("#mapModal")) {
+          closeMap();
+        }
+      };
+    });
   </script>
 </body>
 </html>
